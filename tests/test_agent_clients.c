@@ -1323,7 +1323,11 @@ TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
     ASSERT_NOT_NULL(js);
     ASSERT_NOT_NULL(strstr(js, "export default {"));
     ASSERT_NOT_NULL(strstr(js, "id: 'codebase-memory-augment'"));
-    ASSERT_NOT_NULL(strstr(js, "async setup(ctx) {"));
+    /* Hooks live under server(), which the server runtime reads; setup()
+     * stays empty since the V2 config loader has no tool domain yet. */
+    ASSERT_NOT_NULL(strstr(js, "setup() {}"));
+    ASSERT_NOT_NULL(strstr(js, "server: async (ctx) => {"));
+    ASSERT_NULL(strstr(js, "async setup(ctx) {"));
     ASSERT_NULL(strstr(js, "export const CodebaseMemory"));
     free(js);
     PASS();

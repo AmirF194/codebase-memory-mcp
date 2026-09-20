@@ -303,7 +303,11 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
     sb_append(
         &sb, "export default {\n"
              "  id: 'codebase-memory-augment',\n"
-             "  async setup(ctx) {\n"
+             "  // V2 config loader: requires id + setup|effect; no tool domain yet\n"
+             "  // at this point, so there is nothing to register here.\n"
+             "  setup() {},\n"
+             "  // Server runtime: reads default.server and dispatches the hooks it returns.\n"
+             "  server: async (ctx) => {\n"
              "    const dir = ctx?.directory;\n"
              "    const seen = new Set();\n"
              "    const lifecycle = () =>\n"
