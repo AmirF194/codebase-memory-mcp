@@ -13,6 +13,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "foundation/index_policy.h"
+
 typedef struct cbm_mcp_server cbm_mcp_server_t;
 
 /* ── Version ──────────────────────────────────────────────────── */
@@ -420,6 +422,11 @@ int cbm_config_set(cbm_config_t *cfg, const char *key, const char *value);
 /* Delete a config key. Returns 0 on success. */
 int cbm_config_delete(cbm_config_t *cfg, const char *key);
 
+/* Load and validate the operator-controlled discovery policy. Invalid stored
+ * values fail closed instead of silently disabling a guard. */
+bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t *policy,
+                                  char *error, size_t error_size);
+
 /* Well-known config keys */
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
@@ -483,6 +490,7 @@ void cbm_cli_set_activation_ops_for_test(const cbm_cli_activation_ops_t *ops);
  * private runtime parent. NULL restores the platform default. This is not a
  * command-line or environment override. */
 void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent);
+const char *cbm_cli_activation_runtime_parent_for_test(void);
 
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 
