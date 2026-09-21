@@ -23,6 +23,8 @@
 #define MAX_PARAMS_MINUS_1 31
 #define MAX_RETURN_TYPES 16
 #define MAX_RETURN_TYPES_MINUS_1 15
+#define MAX_ATTR_WRAPPERS 16 // stacked C#/PHP attribute_list siblings per declaration (#1692)
+#define MAX_ATTR_WRAPPERS_MINUS_1 15
 
 // Tree traversal limits.
 enum {
@@ -1323,7 +1325,7 @@ static const char *extract_docstring(CBMArena *a, TSNode node, const char *sourc
     return NULL;
 }
 
-static TSNode find_jvm_modifiers(TSNode node, CBMLanguage lang);
+static int find_jvm_modifiers(TSNode node, CBMLanguage lang, TSNode *out, int max);
 
 /* HTTP method names recognized in decorator calls (e.g., @router.post → "POST") */
 static const char *decorator_method_name(const char *attr_text) {
@@ -1713,12 +1715,9 @@ static void scan_route_annotations(CBMArena *a, TSNode owner, const char *source
     *out_method = NULL;
     *out_jax_path = NULL;
 
-    TSNode wrappers[2];
-    int wn = 0;
-    TSNode modifiers = find_jvm_modifiers(owner, spec->language);
-    if (!ts_node_is_null(modifiers)) {
-        wrappers[wn++] = modifiers;
-    }
+    /* MINUS_1: the owner node itself is appended below, after the wrappers. */
+    TSNode wrappers[MAX_ATTR_WRAPPERS];
+    int wn = find_jvm_modifiers(owner, spec->language, wrappers, MAX_ATTR_WRAPPERS_MINUS_1);
     /* Direct-child annotations (some grammars attach the annotation as a child
      * of the method node rather than under `modifiers`). */
     wrappers[wn++] = owner;
@@ -1872,13 +1871,23 @@ static int count_modifier_annotations(TSNode modifiers, const CBMLangSpec *spec)
     return count;
 }
 
-// Find the wrapper child that holds annotations/attributes for languages where
-// they are nested under an intermediate node rather than being a prev-sibling:
-//   Java/Kotlin/C#/Swift → `modifiers` (contains annotation/attribute)
-//   PHP 8                → `attribute_list` (contains attribute_group)
-// Returns a null node when the language has no such wrapper.
-static TSNode find_jvm_modifiers(TSNode node, CBMLanguage lang) {
-    TSNode null_node = {0};
+// Find every wrapper child that holds annotations/attributes for languages
+// where they are nested under an intermediate node rather than being a
+// prev-sibling:
+//   Java/Kotlin/Swift → `modifiers` (one node, contains every annotation)
+//   C#/PHP 8          → `attribute_list` (contains attribute/attribute_group)
+//
+// C#/PHP attribute stacks are NOT a single wrapper: each bracketed group
+// (`[Foo]`, `[Bar]`, ...) compiles to its own `attribute_list` node, so
+// `[A] [B] [C]` above a declaration produces three separate `attribute_list`
+// siblings among that declaration's children — not one `attribute_list`
+// holding three entries. A field-name lookup (`ts_node_child_by_field_name`)
+// only ever returns the first child registered under a given field, so using
+// it here silently dropped every attribute after the first bracket group
+// (#1692). Scanning all children by kind fixes that for C#/PHP and is a
+// no-op change for Java/Kotlin/Swift, where `modifiers` never repeats.
+// Writes up to `max` wrapper nodes into `out`; returns how many were found.
+static int find_jvm_modifiers(TSNode node, CBMLanguage lang, TSNode *out, int max) {
     const char *wrapper = NULL;
     switch (lang) {
     case CBM_LANG_JAVA:
@@ -1888,19 +1897,12 @@ static TSNode find_jvm_modifiers(TSNode node, CBMLanguage lang) {
         break;
     case CBM_LANG_CSHARP:
     case CBM_LANG_PHP:
-        /* C# attributes live in an `attribute_list` child (modifiers like
-         * `public` are separate `modifier` nodes); PHP 8 likewise nests
-         * `attribute_group` under `attribute_list`. */
         wrapper = "attribute_list";
         break;
     default:
-        return null_node;
+        return 0;
     }
-    TSNode w = ts_node_child_by_field_name(node, wrapper, (uint32_t)strlen(wrapper));
-    if (ts_node_is_null(w)) {
-        w = cbm_find_child_by_kind(node, wrapper);
-    }
-    return w;
+    return cbm_find_children_by_kind(node, wrapper, out, max);
 }
 
 // Count direct children of `node` that are decorator/annotation nodes (used by
@@ -1978,13 +1980,14 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
         prev = ts_node_prev_sibling(prev);
     }
 
-    TSNode modifiers = {0};
+    TSNode wrappers[MAX_ATTR_WRAPPERS];
+    int wn = 0;
     int mod_count = 0;
     int child_count = 0;
     if (count == 0) {
-        modifiers = find_jvm_modifiers(node, lang);
-        if (!ts_node_is_null(modifiers)) {
-            mod_count = count_modifier_annotations(modifiers, spec);
+        wn = find_jvm_modifiers(node, lang, wrappers, MAX_ATTR_WRAPPERS);
+        for (int w = 0; w < wn; w++) {
+            mod_count += count_modifier_annotations(wrappers[w], spec);
         }
         /* Languages like Scala attach the annotation directly as a child of the
          * definition node (no wrapper, no prev-sibling). */
@@ -2014,8 +2017,8 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
         }
         prev = ts_node_prev_sibling(prev);
     }
-    if (!ts_node_is_null(modifiers)) {
-        idx = collect_modifier_decorators(a, modifiers, source, spec, result, idx, total);
+    for (int w = 0; w < wn && mod_count > 0; w++) {
+        idx = collect_modifier_decorators(a, wrappers[w], source, spec, result, idx, total);
     }
     if (child_count > 0) {
         idx = collect_child_decorators(a, node, source, spec, result, idx, total);
@@ -7050,6 +7053,13 @@ typedef struct {
     int cap;
     const char *path; // for the WARN when the ceiling is hit (may be NULL)
     bool warned;
+    /* The per-file traversal scratch (ctx->scratch) when there is one: frames
+     * then come from memory the thread reuses file after file, where a malloc
+     * of 256 frames per file was 28 k allocations and 255 MB never written on
+     * the Go corpus (waste sanitizer, 2026-09-17). Growth copies into a
+     * doubled buffer and abandons the old one to the arena, like TSNodeStack.
+     * NULL: the heap, freed by the walk. */
+    CBMArena *arena;
 } wd_stack_t;
 
 // Generous safety ceiling (frames), env-overridable via CBM_WALK_DEFS_MAX.
@@ -7079,7 +7089,16 @@ static void wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
             }
             return; // bounded: stop growing (warned, not silent)
         }
-        walk_defs_frame_t *nd = safe_realloc(s->data, (size_t)ncap * sizeof(walk_defs_frame_t));
+        walk_defs_frame_t *nd = NULL;
+        if (s->arena) {
+            nd = (walk_defs_frame_t *)cbm_arena_alloc(s->arena,
+                                                      (size_t)ncap * sizeof(walk_defs_frame_t));
+            if (nd && s->top > 0) {
+                memcpy(nd, s->data, (size_t)s->top * sizeof(walk_defs_frame_t));
+            }
+        } else {
+            nd = safe_realloc(s->data, (size_t)ncap * sizeof(walk_defs_frame_t));
+        }
         if (!nd) {
             /* OOM — safe_realloc already freed the old buffer. Bail cleanly: drop
              * pending frames so the walk_defs loop drains and exits without a NULL
@@ -7744,6 +7763,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
     (void)depth_unused;
     wd_stack_t s = {0};
     s.path = ctx->rel_path;
+    s.arena = ctx->scratch;
     wd_push(&s, root, ctx->enclosing_class_qn);
 
     while (s.top > 0) {
@@ -7896,7 +7916,9 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
          * collection is mandatory (see wd_push_children_reverse). */
         wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
     }
-    free(s.data);
+    if (!s.arena) {
+        free(s.data);
+    }
 }
 
 void cbm_extract_definitions_without_module(CBMExtractCtx *ctx) {
