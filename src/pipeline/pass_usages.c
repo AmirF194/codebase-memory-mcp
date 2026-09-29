@@ -201,7 +201,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                     ? cbm_registry_resolve_lineage(ctx->registry, usage->ref_name, module_qn,
                                                    imp_keys, imp_vals, imp_count)
                     : cbm_registry_resolve_lang(ctx->registry, usage->ref_name, module_qn, imp_keys,
-                                               imp_vals, imp_count, lang == CBM_LANG_CSHARP);
+                                                imp_vals, imp_count, lang == CBM_LANG_CSHARP);
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
                 continue;
             }

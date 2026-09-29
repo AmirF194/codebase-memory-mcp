@@ -3125,7 +3125,7 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                     ? cbm_registry_resolve_lineage(rc->registry, usage->ref_name, module_qn,
                                                    imp_keys, imp_vals, imp_count)
                     : cbm_registry_resolve_lang(rc->registry, usage->ref_name, module_qn, imp_keys,
-                                               imp_vals, imp_count, lang == CBM_LANG_CSHARP);
+                                                imp_vals, imp_count, lang == CBM_LANG_CSHARP);
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
                 continue;
             }
@@ -3284,14 +3284,16 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
         if (fn[0] == '\0') {
             continue;
         }
-        cbm_resolution_t res = cbm_registry_resolve_lang(rc->registry, fn, mq, ik, iv, ic, is_csharp);
+        cbm_resolution_t res =
+            cbm_registry_resolve_lang(rc->registry, fn, mq, ik, iv, ic, is_csharp);
         if ((!res.qualified_name || res.qualified_name[0] == '\0') && !strchr(fn, '.')) {
             /* C# attributes are referenced by their short name (`[Log]`) but
              * declared with an `Attribute` suffix (`class LogAttribute`). */
             char with_suffix[CBM_SZ_256];
             int wn = snprintf(with_suffix, sizeof(with_suffix), "%sAttribute", fn);
             if (wn > 0 && (size_t)wn < sizeof(with_suffix)) {
-                res = cbm_registry_resolve_lang(rc->registry, with_suffix, mq, ik, iv, ic, is_csharp);
+                res =
+                    cbm_registry_resolve_lang(rc->registry, with_suffix, mq, ik, iv, ic, is_csharp);
             }
         }
         const cbm_gbuf_node_t *dn = NULL;
