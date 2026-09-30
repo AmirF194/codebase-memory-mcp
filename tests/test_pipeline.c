@@ -3418,14 +3418,17 @@ TEST(pipeline_incremental_root_path_refreshed_across_directories) {
      * would pass even with the fix reverted. */
     ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
 
-    char canon_b[PATH_MAX];
-    ASSERT_NOT_NULL(realpath(dir_b, canon_b));
-
+    /* cbm_pipeline_repo_path()/cbm_store_upsert_project() never call
+     * realpath(): the stored root_path is whatever was passed to
+     * cbm_pipeline_new(), verbatim, on both the full-rebuild path and this
+     * one. Compare against dir_b directly, not a canonicalized form, or
+     * this assertion only holds on a platform where /tmp is not itself a
+     * symlink (it resolves to /private/tmp on macOS). */
     cbm_project_t info = {0};
     cbm_store_t *store = cbm_store_open_path(db);
     ASSERT_NOT_NULL(store);
     ASSERT_EQ(cbm_store_get_project(store, project, &info), CBM_STORE_OK);
-    ASSERT_STR_EQ(info.root_path, canon_b);
+    ASSERT_STR_EQ(info.root_path, dir_b);
     free((char *)info.name);
     free((char *)info.indexed_at);
     free((char *)info.root_path);
