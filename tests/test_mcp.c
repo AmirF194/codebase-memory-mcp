@@ -9,6 +9,7 @@
 #include "../src/foundation/constants.h"
 #include "../src/foundation/log.h"
 #include "../src/foundation/platform.h" /* cbm_file_size */
+#include "../src/foundation/mem.h"      /* cbm_mem_set_budget_for_tests — over-budget seam */
 #include "../src/foundation/subprocess.h"
 #include "../src/foundation/workspace.h"
 #include "../src/mcp/compact_out.h"
@@ -1396,13 +1397,13 @@ TEST(mcp_tools_have_behavior_annotations) {
          * left in place, never quarantined or rebuilt. Quarantine/rebuild is
          * a write-side job (index_repository, manage_adr writes), so the
          * read-only annotations are honest and plan-mode clients can expose
-         * these tools. get_file_outline arrived after this split and keeps
-         * its upstream conservative annotation. */
+         * these tools. get_file_outline reads through the same resolve_store
+         * path and is annotated the same way (#2118). */
         {"search_graph", true, false, true, false},
         {"query_graph", true, false, true, false},
         {"trace_path", true, false, true, false},
         {"get_code_snippet", true, false, true, false},
-        {"get_file_outline", false, true, true, false},
+        {"get_file_outline", true, false, true, false},
         {"get_graph_schema", true, false, true, false},
         {"compare_graphs", true, false, true, false},
         {"get_architecture", true, false, true, false},
@@ -1413,7 +1414,10 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"check_index_coverage", true, false, true, false},
         {"detect_changes", true, false, true, false},
         {"manage_adr", false, true, false, false},
-        {"ingest_traces", false, false, false, false},
+        /* ingest_traces only validates and counts its input; it writes
+         * nothing, so it is read-only and idempotent until edge creation
+         * actually lands (#2118). */
+        {"ingest_traces", true, false, true, false},
     };
 
     char *json = cbm_mcp_tools_list();
@@ -1461,6 +1465,80 @@ TEST(mcp_tools_have_behavior_annotations) {
     }
 
     ASSERT_EQ(matched, sizeof(expected) / sizeof(expected[0]));
+    yyjson_doc_free(doc);
+    free(json);
+    PASS();
+}
+
+/* #2118: annotations drive client auto-approval, so a mis-stamped read tool
+ * is a real integration bug. Walk the REGISTERED tool list (not a mirrored
+ * table) so a newly added tool cannot slip through: every tool must carry
+ * annotations, a read-only tool can never be destructive, and only the tools
+ * whose handlers actually mutate state may be non-read-only. */
+static yyjson_val *find_tool_json(yyjson_val *tools, const char *name) {
+    yyjson_arr_iter iter;
+    yyjson_arr_iter_init(tools, &iter);
+    yyjson_val *tool;
+    while ((tool = yyjson_arr_iter_next(&iter)) != NULL) {
+        const char *tool_name = yyjson_get_str(yyjson_obj_get(tool, "name"));
+        if (tool_name && strcmp(tool_name, name) == 0) {
+            return tool;
+        }
+    }
+    return NULL;
+}
+
+static bool tool_in_list(const char *name, const char *const *list, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(name, list[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+TEST(mcp_tool_annotations_only_mutators_are_writable_issue2118) {
+    /* Handlers that write user-visible state: index_repository (builds the
+     * index), manage_adr (writes/overwrites ADR sections), delete_project
+     * (removes the index). Everything else must be read-only. */
+    static const char *const mutating[] = {"index_repository", "manage_adr", "delete_project"};
+    /* Of those, only the ones that can remove/overwrite existing data. */
+    static const char *const destructive[] = {"manage_adr", "delete_project"};
+    const size_t n_mut = sizeof(mutating) / sizeof(mutating[0]);
+    const size_t n_des = sizeof(destructive) / sizeof(destructive[0]);
+
+    char *json = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *tools = yyjson_obj_get(yyjson_doc_get_root(doc), "tools");
+    ASSERT_NOT_NULL(tools);
+
+    int count = cbm_mcp_tool_count();
+    ASSERT_GT(count, 0);
+    ASSERT_EQ(yyjson_arr_size(tools), (size_t)count);
+    for (int i = 0; i < count; i++) {
+        const char *name = cbm_mcp_tool_name(i);
+        ASSERT_NOT_NULL(name);
+        yyjson_val *tool = find_tool_json(tools, name);
+        ASSERT_NOT_NULL(tool);
+        yyjson_val *annotations = yyjson_obj_get(tool, "annotations");
+        ASSERT_NOT_NULL(annotations);
+        yyjson_val *read_only = yyjson_obj_get(annotations, "readOnlyHint");
+        yyjson_val *destr = yyjson_obj_get(annotations, "destructiveHint");
+        ASSERT_TRUE(yyjson_is_bool(read_only));
+        ASSERT_TRUE(yyjson_is_bool(destr));
+        bool is_mut = tool_in_list(name, mutating, n_mut);
+        bool is_des = tool_in_list(name, destructive, n_des);
+        if (yyjson_get_bool(read_only) == is_mut || yyjson_get_bool(destr) != is_des) {
+            printf("  tool %s: readOnlyHint=%d destructiveHint=%d (want %d/%d)\n", name,
+                   (int)yyjson_get_bool(read_only), (int)yyjson_get_bool(destr), (int)!is_mut,
+                   (int)is_des);
+        }
+        ASSERT_EQ(yyjson_get_bool(read_only), !is_mut);
+        ASSERT_EQ(yyjson_get_bool(destr), is_des);
+    }
+
     yyjson_doc_free(doc);
     free(json);
     PASS();
@@ -3384,6 +3462,63 @@ TEST(tool_index_status_keeps_authoritative_ignored_total_when_rows_are_sampled) 
     PASS();
 }
 
+/* #2012: a COUNT(*) that cannot be read must not be reported as an empty
+ * project. The store now returns CBM_STORE_ERR for a failed step, and
+ * index_status has to say the read failed rather than answering "empty" with
+ * a bare -1 as the count. Dropping the tables after the first call makes the
+ * step (not the prepare) fail deterministically, because the statements are
+ * cached by then. */
+TEST(tool_index_status_reports_an_unreadable_count_as_an_error) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    /* First call: a healthy project, and it caches the count statements. */
+    char *response = cbm_mcp_handle_tool(srv, "index_status",
+                                         "{\"project\":\"test-project\",\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "status")), "ready");
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    ASSERT_EQ(cbm_store_exec(store, "DROP TABLE nodes;"), 0);
+    ASSERT_EQ(cbm_store_exec(store, "DROP TABLE edges;"), 0);
+
+    response = cbm_mcp_handle_tool(srv, "index_status",
+                                   "{\"project\":\"test-project\",\"format\":\"json\"}");
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+
+    /* Not "empty": that is the false all-clear the issue is about. */
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "status")), "error");
+
+    /* A failed read is not a count, so no negative number reaches the caller. */
+    ASSERT_TRUE(yyjson_get_int(yyjson_obj_get(root, "nodes")) >= 0);
+    ASSERT_TRUE(yyjson_get_int(yyjson_obj_get(root, "edges")) >= 0);
+
+    /* The hint names the unreadable table instead of telling the user to
+     * re-index an "empty" project. */
+    const char *hint = yyjson_get_str(yyjson_obj_get(root, "hint"));
+    ASSERT_NOT_NULL(hint);
+    ASSERT_TRUE(strstr(hint, "could not be read") != NULL);
+    ASSERT_TRUE(strstr(hint, "Project is empty") == NULL);
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_output_byte_budgets) {
     /* GUARD: absolute byte ceilings on default tool outputs. Re-bloat (e.g.
      * a property blob sneaking back into row emission — the fp field alone
@@ -3779,6 +3914,124 @@ TEST(tool_search_graph_bm25_reports_candidate_saturation) {
     ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"gte\""));
     ASSERT_NOT_NULL(strstr(inner, "\"candidate_window_saturated\":true"));
     ASSERT_NOT_NULL(strstr(inner, "\"truncated\":true"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Shared fixture for the two BM25 findability probes (2026-09-16, measured on
+ * JetBrains/Exposed and django/django): a Class named exactly like the query,
+ * that class's own Methods, and test Methods whose long names repeat the
+ * query token — the shapes that outranked the class and hid it entirely. */
+static void bm25_findability_fixture(cbm_store_t *store, const char *project) {
+    cbm_store_upsert_project(store, project, "/tmp/bm25-findability");
+    struct {
+        const char *label, *name, *qn, *file;
+    } rows[] = {
+        {"Class", "Table", "bm25-find.core.Table.Table", "core/Table.kt"},
+        {"Method", "unquoted", "bm25-find.core.Table.Table.unquoted", "core/Table.kt"},
+        {"Method", "describe", "bm25-find.core.Table.Table.describe", "core/Table.kt"},
+        {"Method", "table references table with same name in other database",
+         "bm25-find.tests.SchemaTests.table_references_table_with_same_name", "tests/Schema.kt"},
+        {"Method", "table references table with same name in mysql",
+         "bm25-find.tests.SchemaTests.table_references_table_with_same_name_mysql",
+         "tests/Schema.kt"},
+        {"Function", "get_object_or_404", "bm25-find.shortcuts.get_object_or_404", "shortcuts.py"},
+        {"Method", "test_get_object_or_404",
+         "bm25-find.tests.GetObjectOr404Tests.test_get_object_or_404", "tests/tests.py"},
+        {"Method", "test_get_object_or_404_queryset_attribute_error",
+         "bm25-find.tests.GetObjectOr404Tests.test_get_object_or_404_queryset_attribute_error",
+         "tests/tests.py"},
+        {"Method", "test_get_object_or_404_bad_class",
+         "bm25-find.tests.GetListObjectOr404Test.test_get_object_or_404_bad_class",
+         "tests/async.py"},
+    };
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        cbm_node_t node = {.project = project,
+                           .label = rows[i].label,
+                           .name = rows[i].name,
+                           .qualified_name = rows[i].qn,
+                           .file_path = rows[i].file,
+                           .start_line = (int)i + 1,
+                           .end_line = (int)i + 2};
+        cbm_store_upsert_node(store, &node);
+    }
+    cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                          "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                          "label, file_path FROM nodes;");
+}
+
+/* The label filter must apply in query (BM25) mode exactly as in structural
+ * mode: `query=Table label=Class` returns the class, and no Method. */
+TEST(tool_search_graph_bm25_applies_label_filter) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-find";
+    cbm_mcp_server_set_project(srv, project);
+    bm25_findability_fixture(store, project);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":554,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"Table\",\"label\":\"Class\","
+             "\"limit\":5,\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-find.core.Table.Table\",\"Class\""));
+    ASSERT_NULL(strstr(inner, "\"Method\""));
+    /* The reported total describes the filtered rows, not the unfiltered window. */
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":1"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* The definition whose NAME is the query ranks first: the `Table` class above
+ * its own methods and above test methods that repeat "table" three times; the
+ * `get_object_or_404` function above the test methods that contain it. */
+TEST(tool_search_graph_bm25_ranks_exact_name_first) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-find";
+    cbm_mcp_server_set_project(srv, project);
+    bm25_findability_fixture(store, project);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":555,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"Table\",\"limit\":5,\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    const char *rows = strstr(inner, "\"rows\":[");
+    ASSERT_NOT_NULL(rows);
+    const char *first_qn = strstr(rows, "[\"");
+    ASSERT_NOT_NULL(first_qn);
+    ASSERT_EQ(strncmp(first_qn, "[\"bm25-find.core.Table.Table\"", 29), 0);
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":556,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"get_object_or_404\",\"limit\":5,"
+             "\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    rows = strstr(inner, "\"rows\":[");
+    ASSERT_NOT_NULL(rows);
+    first_qn = strstr(rows, "[\"");
+    ASSERT_NOT_NULL(first_qn);
+    ASSERT_EQ(strncmp(first_qn, "[\"bm25-find.shortcuts.get_object_or_404\"", 40), 0);
     free(inner);
     free(resp);
     cbm_mcp_server_free(srv);
@@ -5582,9 +5835,9 @@ TEST(tool_check_index_coverage_reports_truncation_marker_issue963) {
 
     /* The marked file: both real ranges survive, the marker is flagged, and the
      * "12" from the marker never becomes a range of its own. */
-    char *marked =
-        cbm_mcp_handle_tool(srv, "check_index_coverage",
-                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/marked.c\"],\"format\":\"json\"}");
+    char *marked = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"coverage-marker\",\"paths\":[\"src/marked.c\"],\"format\":\"json\"}");
     ASSERT_NOT_NULL(marked);
     char *marked_inner = extract_text_content(marked);
     ASSERT_NOT_NULL(marked_inner);
@@ -5596,9 +5849,9 @@ TEST(tool_check_index_coverage_reports_truncation_marker_issue963) {
     free(marked);
 
     /* The same ranges without a marker must NOT be reported as truncated. */
-    char *plain =
-        cbm_mcp_handle_tool(srv, "check_index_coverage",
-                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/plain.c\"],\"format\":\"json\"}");
+    char *plain = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"coverage-marker\",\"paths\":[\"src/plain.c\"],\"format\":\"json\"}");
     ASSERT_NOT_NULL(plain);
     char *plain_inner = extract_text_content(plain);
     ASSERT_NOT_NULL(plain_inner);
@@ -5609,9 +5862,9 @@ TEST(tool_check_index_coverage_reports_truncation_marker_issue963) {
 
     /* The reader's own limit stops the list early, so it must say so even
      * though the producer sent no marker. */
-    char *widest =
-        cbm_mcp_handle_tool(srv, "check_index_coverage",
-                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/wide.c\"],\"format\":\"json\"}");
+    char *widest = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"coverage-marker\",\"paths\":[\"src/wide.c\"],\"format\":\"json\"}");
     ASSERT_NOT_NULL(widest);
     char *wide_inner = extract_text_content(widest);
     ASSERT_NOT_NULL(wide_inner);
@@ -5725,20 +5978,15 @@ TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_
     ASSERT_NOT_NULL(store);
     char source_path[512];
     snprintf(source_path, sizeof(source_path), "%s/project/main.go", tmp);
-    struct stat source_stat;
-    ASSERT_EQ(stat(source_path, &source_stat), 0);
-#ifdef __APPLE__
-    int64_t source_mtime_ns =
-        ((int64_t)source_stat.st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-        (int64_t)source_stat.st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    int64_t source_mtime_ns = (int64_t)source_stat.st_mtime * (int64_t)CBM_NSEC_PER_SEC;
-#else
-    int64_t source_mtime_ns = ((int64_t)source_stat.st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-                              (int64_t)source_stat.st_mtim.tv_nsec;
-#endif
-    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", source_mtime_ns,
-                                         source_stat.st_size),
+    /* The fixture must record the hash with the SAME mtime source the indexer
+     * writes with — cbm_path_info_utf8 — not struct stat. On Windows stat
+     * truncates to seconds while the stored record carries FILETIME-derived
+     * nanoseconds, so a stat-written fixture would never compare equal and the
+     * metadata_match contract below would fail. */
+    cbm_path_info_t path_info;
+    ASSERT_EQ(cbm_path_info_utf8(source_path, &path_info), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", path_info.mtime_ns,
+                                         path_info.size),
               CBM_STORE_OK);
     cbm_project_t project = {0};
     ASSERT_EQ(cbm_store_get_project(store, "test-project", &project), CBM_STORE_OK);
@@ -5778,6 +6026,63 @@ TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_
     free(response);
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* #1714: coverage freshness must compare mtime_ns at the SAME precision the
+ * indexer records it. The pipeline records cbm_path_info_utf8's value (which
+ * on Windows derives from FILETIME — nanosecond), while the freshness reader
+ * used to recompute from struct stat, which on Windows truncates to seconds
+ * (st_mtime). A byte-identical file therefore never matched and every path was
+ * reported metadata_changed. The reader now uses the indexer's own source. */
+TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/project/main.go", tmp);
+    cbm_path_info_t info;
+    ASSERT_EQ(cbm_path_info_utf8(source_path, &info), 0);
+
+    /* The hash exactly as the indexer writes it: same source, ns precision. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", info.mtime_ns,
+                                         info.size),
+              CBM_STORE_OK);
+
+    /* format=json, like every other coverage test here: the DEFAULT response is
+     * the compact table, in which a field name never appears. Keeping the
+     * assertion on the JSON field is what makes it exact — a bare strstr for
+     * "metadata_match" would also be satisfied by a neighbouring column or by
+     * another path's row. */
+    char *response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                         "{\"project\":\"test-project\",\"paths\":[\"main.go\"],"
+                                         "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"freshness\":\"metadata_match\""));
+    free(response);
+
+    /* A hash stored at seconds precision — what a stat-based reader previously
+     * compared against — must NOT match an unchanged file: the comparison must
+     * stay nanosecond-exact, or part of mtime resolution is silently dropped. */
+    int64_t seconds_mtime_ns = (info.mtime_ns / (int64_t)CBM_NSEC_PER_SEC) *
+                               (int64_t)CBM_NSEC_PER_SEC;
+    if (seconds_mtime_ns != info.mtime_ns) {
+        ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "",
+                                             seconds_mtime_ns, info.size),
+                  CBM_STORE_OK);
+        response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                       "{\"project\":\"test-project\",\"paths\":[\"main.go\"],"
+                                       "\"format\":\"json\"}");
+        ASSERT_NOT_NULL(response);
+        ASSERT_NOT_NULL(strstr(response, "\"freshness\":\"metadata_changed\""));
+        free(response);
+    }
+
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
     PASS();
 }
 
@@ -8207,6 +8512,197 @@ TEST(tool_project_arg_resolves_unique_tail_issue1025) {
     th_rmtree(repo_a);
     th_rmtree(repo_b);
     th_rmtree(repo_c);
+    th_rmtree(cache);
+    PASS();
+}
+
+/* #1827: a repo under a non-ASCII folder ("中文测试仓库") gets a project name
+ * whose non-ASCII bytes are hex-transliterated (#571), e.g.
+ * "...-e4b8ade69687e6b58be8af95e4bb93e5ba93". That stored identity stays
+ * stable (it is the cache DB file name), but the project must stay reachable
+ * by what the user actually knows: the real path (already normalized) AND the
+ * real folder name, which the #1025 tail match skipped because the raw
+ * non-ASCII name fails the project-name validator before any lookup. */
+TEST(tool_project_arg_resolves_non_ascii_folder_issue1827) {
+    char parent[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(parent, sizeof(parent), "/tmp/cbm-i1827a-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-i1827c-XXXXXX");
+    if (!cbm_mkdtemp(parent) || !cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+    const char *folder = "\xe4\xb8\xad\xe6\x96\x87\xe6\xb5\x8b\xe8\xaf\x95\xe4\xbb\x93\xe5\xba\x93";
+    char repo[CBM_SZ_512];
+    snprintf(repo, sizeof(repo), "%s/%s", parent, folder);
+    ASSERT_TRUE(cbm_mkdir_p(repo, 0755));
+    char file[CBM_SZ_1K];
+    snprintf(file, sizeof(file), "%s/hello.js", repo);
+    FILE *f = cbm_fopen(file, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "function greet_1827(){return 'hi';}\n");
+    fclose(f);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[CBM_SZ_2K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", repo);
+    char *r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    free(r);
+
+    /* The stored identity keeps its existing hex form (no DB rename). */
+    char *stored = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(stored);
+    ASSERT_NOT_NULL(strstr(stored, "-e4b8ade69687e6b58be8af95e4bb93e5ba93"));
+    free(stored);
+
+    /* 1. The real folder name resolves (RED before: "project not found"). */
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\".*greet_1827.*\"}",
+             folder);
+    r = cbm_mcp_handle_tool(srv, "search_graph", args);
+    ASSERT_NOT_NULL(r);
+    if (strstr(r, "project not found")) {
+        fprintf(stderr, "  [1827] FAIL folder name did not resolve: %.200s\n", r);
+    }
+    ASSERT_NULL(strstr(r, "project not found"));
+    ASSERT_NOT_NULL(strstr(r, "greet_1827"));
+    free(r);
+
+    /* 2. The real path keeps resolving. */
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\".*greet_1827.*\"}", repo);
+    r = cbm_mcp_handle_tool(srv, "search_graph", args);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(strstr(r, "project not found"));
+    ASSERT_NOT_NULL(strstr(r, "greet_1827"));
+    free(r);
+
+    /* 3. A non-ASCII name matching nothing stays a not-found error. */
+    r = cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"\xe4\xb8\x8d\xe5\xad\x98\xe5\x9c\xa8\","
+                            "\"name_pattern\":\".*\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "project not found"));
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(parent);
+    th_rmtree(cache);
+    PASS();
+}
+
+/* #2134: re-indexing a root WITHOUT `name` must update the project that
+ * already owns that root_path, not fork a second index under the
+ * path-derived name (both then list the same root_path and the stale one
+ * keeps being read as fresh). Several owners of one root are ambiguous: the
+ * call must fail loudly and name them instead of guessing or forking. */
+static int i2134_count_occurrences(const char *haystack, const char *needle) {
+    int count = 0;
+    for (const char *p = haystack ? strstr(haystack, needle) : NULL; p; p = strstr(p + 1, needle)) {
+        count++;
+    }
+    return count;
+}
+
+TEST(tool_index_repository_reuses_existing_project_for_root_issue2134) {
+    char repo[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-i2134r-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-i2134c-XXXXXX");
+    if (!cbm_mkdtemp(repo) || !cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+    char canonical_repo[CBM_SZ_4K]; /* cbm_canonical_path needs >= 4096 bytes */
+    if (!cbm_canonical_path(repo, canonical_repo, sizeof(canonical_repo))) {
+        FAIL("cbm_canonical_path failed");
+    }
+    /* Stored root_path values use forward slashes on every platform. */
+    cbm_normalize_path_sep(canonical_repo);
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    const char *saved_sup = getenv("CBM_INDEX_SUPERVISOR");
+    char *saved_sup_copy = saved_sup ? cbm_strdup(saved_sup) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+    i1025_write_repo(repo, "root_owner_2134");
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* 1. Index once under an explicit name. */
+    char args[CBM_SZ_1K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"named-2134\"}", repo);
+    char *r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "named-2134"));
+    free(r);
+
+    /* 2. Re-index the same root without a name: must update named-2134. */
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", repo);
+    r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    if (!strstr(r, "named-2134")) {
+        fprintf(stderr, "  [2134] reindex without name forked: %.300s\n", r);
+    }
+    ASSERT_NOT_NULL(strstr(r, "named-2134"));
+    free(r);
+
+    /* Every listed project carries its root_path once in structuredContent,
+     * so the canonical root occurring once there means exactly one owner. */
+    r = cbm_mcp_handle_tool(srv, "list_projects", "{\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "\"structuredContent\""));
+    int owners = i2134_count_occurrences(strstr(r, "\"structuredContent\""), canonical_repo);
+    if (owners != 1) {
+        fprintf(stderr, "  [2134] %d projects share root %s: %.400s\n", owners, canonical_repo, r);
+    }
+    ASSERT_EQ(owners, 1);
+    free(r);
+
+    /* 3. An explicit second name is the caller's choice; afterwards the root
+     * has two owners, so an unnamed re-index must refuse and list both. */
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"other-2134\"}", repo);
+    r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "other-2134"));
+    free(r);
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", repo);
+    r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "named-2134"));
+    ASSERT_NOT_NULL(strstr(r, "other-2134"));
+    ASSERT_NOT_NULL(strstr(r, "\"isError\":true"));
+    free(r);
+    r = cbm_mcp_handle_tool(srv, "list_projects", "{\"format\":\"json\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "\"structuredContent\""));
+    ASSERT_EQ(i2134_count_occurrences(strstr(r, "\"structuredContent\""), canonical_repo), 2);
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_sup_copy) {
+        cbm_setenv("CBM_INDEX_SUPERVISOR", saved_sup_copy, 1);
+        free(saved_sup_copy);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    }
+    th_rmtree(repo);
     th_rmtree(cache);
     PASS();
 }
@@ -13956,6 +14452,146 @@ TEST(tool_detect_changes_finds_nested_untracked_file_and_impact_seed) {
     PASS();
 }
 
+/* Issue #1951: the indexed project root is a SUBDIRECTORY of a normal Git
+ * repository. Git reports changed paths relative to the Git root
+ * ("game/src/math.c"), while graph file_paths are relative to the project
+ * root ("src/math.c"). detect_changes must translate Git-root paths into the
+ * project's coordinate system (diff, hunk and status records alike) and leave
+ * changes outside the project out, or the seed lookup finds nothing. */
+TEST(tool_detect_changes_subdirectory_project_translates_git_root_paths_issue1951) {
+    char repo[CBM_SZ_4K];
+    snprintf(repo, sizeof(repo), "%s/cbm-detect-subdir-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[CBM_SZ_4K];
+    snprintf(cache, sizeof(cache), "%s/cbm-detect-subdir-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    char project_root[CBM_SZ_4K];
+    snprintf(project_root, sizeof(project_root), "%s/game", repo);
+    ASSERT_EQ(cbm_mkdir(project_root), 0);
+    char source_dir[CBM_SZ_4K];
+    snprintf(source_dir, sizeof(source_dir), "%s/src", project_root);
+    ASSERT_EQ(cbm_mkdir(source_dir), 0);
+    char math_source[CBM_SZ_4K];
+    snprintf(math_source, sizeof(math_source), "%s/math.c", source_dir);
+    ASSERT_EQ(th_write_file(math_source, "int add_one(int x) { return x + 1; }\n"
+                                         "int untouched(void) { return 0; }\n"),
+              0);
+    char use_source[CBM_SZ_4K];
+    snprintf(use_source, sizeof(use_source), "%s/use.c", source_dir);
+    ASSERT_EQ(
+        th_write_file(use_source, "int add_one(int x);\nint use_it(void) { return add_one(4); }\n"),
+        0);
+    char outside_source[CBM_SZ_4K];
+    snprintf(outside_source, sizeof(outside_source), "%s/outside.c", repo);
+    ASSERT_EQ(th_write_file(outside_source, "int outside(void) { return 0; }\n"), 0);
+
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const add_args[] = {"add", "-A", NULL};
+    const char *const commit_args[] = {
+        "-c",     "user.name=cbm-test",
+        "-c",     "user.email=cbm-test@example.invalid",
+        "-c",     "commit.gpgsign=false",
+        "commit", "-q",
+        "-m",     "fixture",
+        NULL,
+    };
+    ASSERT_EQ(mcp_test_git(repo, init_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, add_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, commit_args), 0);
+
+    /* Worktree edits: a tracked change inside the project (diff + hunk path),
+     * an untracked file inside it (status path) and a change outside it. */
+    ASSERT_EQ(th_write_file(math_source, "int add_one(int x) { return x + 2; }\n"
+                                         "int untouched(void) { return 0; }\n"),
+              0);
+    char fresh_source[CBM_SZ_4K];
+    snprintf(fresh_source, sizeof(fresh_source), "%s/fresh.c", source_dir);
+    ASSERT_EQ(th_write_file(fresh_source, "int fresh(void) { return 1; }\n"), 0);
+    ASSERT_EQ(th_write_file(outside_source, "int outside(void) { return 1; }\n"), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "detect-subdir-project";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, project_root), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    cbm_node_t seed = {.project = project,
+                       .label = "Function",
+                       .name = "add_one",
+                       .qualified_name = "fixture.src.math.add_one",
+                       .file_path = "src/math.c",
+                       .start_line = 1,
+                       .end_line = 1};
+    int64_t seed_id = cbm_store_upsert_node(store, &seed);
+    ASSERT_GT(seed_id, 0);
+    /* Same file, untouched line: only hunk scoping (project-relative hunk
+     * paths) keeps it out of the seeds; whole-file fallback would add it. */
+    cbm_node_t untouched = {.project = project,
+                            .label = "Function",
+                            .name = "untouched",
+                            .qualified_name = "fixture.src.math.untouched",
+                            .file_path = "src/math.c",
+                            .start_line = 2,
+                            .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(store, &untouched), 0);
+    cbm_node_t caller = {.project = project,
+                         .label = "Function",
+                         .name = "use_it",
+                         .qualified_name = "fixture.src.use.use_it",
+                         .file_path = "src/use.c",
+                         .start_line = 2,
+                         .end_line = 2};
+    int64_t caller_id = cbm_store_upsert_node(store, &caller);
+    ASSERT_GT(caller_id, 0);
+    cbm_edge_t edge = {
+        .project = project, .source_id = caller_id, .target_id = seed_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "detect_changes",
+                            "{\"project\":\"detect-subdir-project\",\"base_branch\":\"HEAD\","
+                            "\"scope\":\"impact\",\"depth\":2,\"max_output_tokens\":10000,"
+                            "\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *changed_files = root ? yyjson_obj_get(root, "changed_files") : NULL;
+    yyjson_val *first_path = changed_files ? yyjson_arr_get(changed_files, 0) : NULL;
+    yyjson_val *second_path = changed_files ? yyjson_arr_get(changed_files, 1) : NULL;
+    yyjson_val *impacted = root ? yyjson_obj_get(root, "impacted") : NULL;
+    yyjson_val *first_impact = impacted ? yyjson_arr_get(impacted, 0) : NULL;
+    bool project_relative_paths =
+        root && yyjson_get_int(yyjson_obj_get(root, "changed_total")) == 2 && first_path &&
+        second_path && strcmp(yyjson_get_str(first_path), "src/fresh.c") == 0 &&
+        strcmp(yyjson_get_str(second_path), "src/math.c") == 0;
+    bool seed_found = root && yyjson_get_int(yyjson_obj_get(root, "seed_symbols")) == 1;
+    bool impact_found = first_impact && strcmp(yyjson_get_str(yyjson_obj_get(first_impact, "qn")),
+                                               "fixture.src.use.use_it") == 0;
+    if (!project_relative_paths || !seed_found || !impact_found) {
+        fprintf(stderr, "  issue1951 response: %s\n", inner ? inner : "(null)");
+    }
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    ASSERT_EQ(th_rmtree(cache), 0);
+    ASSERT_EQ(th_rmtree(repo), 0);
+
+    ASSERT_TRUE(project_relative_paths);
+    ASSERT_TRUE(seed_found);
+    ASSERT_TRUE(impact_found);
+    PASS();
+}
+
 TEST(tool_detect_changes_escapes_newline_path_in_tree_and_round_trips_json) {
 #ifdef _WIN32
     /* Win32 rejects control characters in filenames, so Windows cannot create
@@ -17670,6 +18306,171 @@ static int idx823_supervised_name_override_check(const char *repo_dir, const cha
 }
 #endif
 
+/* Write the 64-file Go fixture (above MIN_FILES_FOR_PARALLEL, so the gated
+ * parallel extract path runs). generation 2 gives every file a second
+ * definition so a re-run must re-extract all of them — an unchanged repo is an
+ * incremental no-op and never reaches the memory gate. */
+static bool budget_fixture_write(const char *repo, int generation) {
+    for (int i = 0; i < 64; i++) {
+        char path[CBM_SZ_1K];
+        char body[CBM_SZ_256];
+        snprintf(path, sizeof(path), "%s/f%02d.go", repo, i);
+        if (generation == 1) {
+            snprintf(body, sizeof(body), "package main\n\nfunc F%02d() int {\n\treturn %d\n}\n", i,
+                     i);
+        } else {
+            snprintf(body, sizeof(body),
+                     "package main\n\nfunc F%02d() int {\n\treturn %d\n}\n\n"
+                     "func G%02d() int {\n\treturn F%02d() + 1\n}\n",
+                     i, i, i, i);
+        }
+        if (th_write_file(path, body) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Parse the JSON object inside an MCP tool result. NULL when absent. */
+static yyjson_doc *budget_result_doc(const char *result) {
+    char *text = extract_text_content(result);
+    yyjson_doc *doc = text ? yyjson_read(text, strlen(text), 0) : NULL;
+    free(text);
+    return doc;
+}
+
+static const char *budget_doc_str(yyjson_doc *doc, const char *key) {
+    return doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), key)) : NULL;
+}
+
+static int budget_doc_int(yyjson_doc *doc, const char *key, int missing) {
+    yyjson_val *val = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), key) : NULL;
+    return val && yyjson_is_int(val) ? (int)yyjson_get_int(val) : missing;
+}
+
+/* Decision A (#1997 #832): an attempt that stays over the memory budget after
+ * back-pressure fails WHOLE and the response says so — reason, numbers, hint,
+ * and that the previous index still serves — instead of the generic "check
+ * repo_path" error. In-process: the runner is never a marked supervisor host,
+ * and the budget seam stands in for a 1 MiB machine. */
+TEST(index_repository_over_budget_reports_named_reason) {
+    char repo[CBM_SZ_1K];
+    char cache[CBM_SZ_1K];
+    snprintf(repo, sizeof(repo), "%s/cbm-mcp-budget-repo-XXXXXX", cbm_tmpdir());
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-budget-cache-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(repo)) {
+        FAIL("cbm_mkdtemp repo failed");
+    }
+    if (!cbm_mkdtemp(cache)) {
+        th_rmtree(repo);
+        FAIL("cbm_mkdtemp cache failed");
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_workers = getenv("CBM_WORKERS");
+    char *saved_workers_copy = saved_workers ? strdup(saved_workers) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    bool files_ok = budget_fixture_write(repo, 1);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    bool had_server = srv != NULL;
+    char args[CBM_SZ_2K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", repo);
+
+    /* Generation 1 at the process budget publishes. */
+    char *first = srv && files_ok ? cbm_mcp_handle_tool(srv, "index_repository", args) : NULL;
+    yyjson_doc *first_doc = budget_result_doc(first);
+    const char *first_status = budget_doc_str(first_doc, "status");
+    bool first_indexed = first_status && strcmp(first_status, "indexed") == 0;
+    int nodes_first = budget_doc_int(first_doc, "nodes", -1);
+    const char *first_project = budget_doc_str(first_doc, "project");
+    char *project = first_project ? strdup(first_project) : NULL;
+    yyjson_doc_free(first_doc);
+    free(first);
+    char db_path[CBM_SZ_2K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project ? project : "missing");
+    long db_size_before = (long)cbm_file_size(db_path);
+
+    /* Generation 2 at 1 MiB over a changed repo fails whole. */
+    files_ok = files_ok && budget_fixture_write(repo, 2);
+    size_t saved_budget = cbm_mem_budget();
+    cbm_mem_set_budget_for_tests((size_t)1024 * 1024);
+    char *second = srv && files_ok ? cbm_mcp_handle_tool(srv, "index_repository", args) : NULL;
+    cbm_mem_set_budget_for_tests(saved_budget);
+    bool second_is_error = second && strstr(second, "\"isError\":true") != NULL;
+    yyjson_doc *second_doc = budget_result_doc(second);
+    const char *second_status = budget_doc_str(second_doc, "status");
+    const char *second_reason = budget_doc_str(second_doc, "reason");
+    const char *second_previous = budget_doc_str(second_doc, "previous_index");
+    const char *second_hint = budget_doc_str(second_doc, "hint");
+    bool status_error = second_status && strcmp(second_status, "error") == 0;
+    bool reason_named = second_reason && strcmp(second_reason, "over_memory_budget") == 0;
+    bool previous_preserved = second_previous && strcmp(second_previous, "preserved") == 0;
+    bool hint_names_knob = second_hint && strstr(second_hint, "CBM_MEM_BUDGET_MB") != NULL;
+    /* The hint must also say that peak_rss_mb is NOT the requirement. The abort
+     * fires when RSS crosses the budget, so the peak is pinned just above it by
+     * construction; a caller who retries at peak+10% fails again. Measured on
+     * the linux kernel 2026-09-13: aborted at 25622 MB against a 24576 MB
+     * budget, but completing it took 31.75 GB. */
+    bool hint_warns_peak_is_not_need = second_hint && strstr(second_hint, "STOPPED") != NULL;
+    int budget_mb = budget_doc_int(second_doc, "budget_mb", -1);
+    int peak_rss_mb = budget_doc_int(second_doc, "peak_rss_mb", -1);
+    int suggested_mb = budget_doc_int(second_doc, "suggested_budget_mb", -1);
+    yyjson_doc_free(second_doc);
+    free(second);
+    long db_size_after = (long)cbm_file_size(db_path);
+
+    /* The previous generation still answers with its full graph. */
+    char status_args[CBM_SZ_2K];
+    snprintf(status_args, sizeof(status_args), "{\"project\":\"%s\"}", project ? project : "");
+    char *status = srv && project ? cbm_mcp_handle_tool(srv, "index_status", status_args) : NULL;
+    /* index_status answers in the tree format ("nodes: <n>" on its own line). */
+    char *status_text = extract_text_content(status);
+    const char *nodes_line = status_text ? strstr(status_text, "\nnodes: ") : NULL;
+    int nodes_after = nodes_line ? (int)strtol(nodes_line + strlen("\nnodes: "), NULL, 10) : -1;
+    if (nodes_after != nodes_first) {
+        printf("    index_status after the failed attempt: %.400s\n",
+               status_text ? status_text : "(null)");
+    }
+    free(status_text);
+    free(status);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    free(project);
+    if (saved_workers_copy) {
+        cbm_setenv("CBM_WORKERS", saved_workers_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    free(saved_workers_copy);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    th_rmtree(repo);
+
+    ASSERT_TRUE(files_ok);
+    ASSERT_TRUE(had_server);
+    ASSERT_TRUE(first_indexed);
+    ASSERT_GT(nodes_first, 0);
+    ASSERT_TRUE(second_is_error);
+    ASSERT_TRUE(status_error);
+    ASSERT_TRUE(reason_named);
+    ASSERT_TRUE(previous_preserved);
+    ASSERT_TRUE(hint_names_knob);
+    ASSERT_TRUE(hint_warns_peak_is_not_need);
+    ASSERT_EQ(budget_mb, 1);
+    ASSERT_GT(peak_rss_mb, budget_mb);
+    /* A CONCRETE retry value, not just the knob name: 1.5x the budget. */
+    ASSERT_GT(suggested_mb, budget_mb);
+    /* Preserved on disk and still served: same file size, same node count. */
+    ASSERT_GT(db_size_before, 0L);
+    ASSERT_EQ(db_size_after, db_size_before);
+    ASSERT_EQ(nodes_after, nodes_first);
+    PASS();
+}
+
 TEST(index_repository_cli_name_override_issue823) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX fork harness required to isolate supervisor host mark");
@@ -18943,22 +19744,72 @@ TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
- *  #1466 — autoindex.skip must report the effective numeric limit
+ *  #1466 / #713 — the auto_index_limit guard
+ *
+ *  #1466: autoindex.skip must report the effective numeric limit.
+ *  #713:  the guard must bound NON-git roots. The 0.8.x guard counted
+ *         `git ls-files | wc -l`, which is 0 outside a checkout, so a plain
+ *         directory of 60k files was walked in full (tens of GB RSS). The
+ *         bounded discovery count applies to every root, and the skip line
+ *         names the limit AND the root so the reporter can act on it.
  * ══════════════════════════════════════════════════════════════════ */
 
 static char autoindex_skip_log[1024];
+static bool autoindex_saw_done;
 
-/* Keeps only the too_many_files skip line, so later lines cannot displace it. */
-static void autoindex_skip_capture_log(const char *line) {
-    if (line && strstr(line, "msg=autoindex.skip") && strstr(line, "reason=too_many_files")) {
+/* Keeps only the too_many_files skip line, so later lines cannot displace it,
+ * and records whether an admitted auto-index actually ran to completion. */
+static void autoindex_limit_capture_log(const char *line) {
+    if (!line) {
+        return;
+    }
+    if (strstr(line, "msg=autoindex.skip") && strstr(line, "reason=too_many_files")) {
         snprintf(autoindex_skip_log, sizeof(autoindex_skip_log), "%s", line);
+    }
+    if (strstr(line, "msg=autoindex.done")) {
+        autoindex_saw_done = true;
     }
 }
 
-/* Drive initialize → maybe_auto_index over a fresh project holding more tracked
- * files than auto_index_limit, and capture the resulting skip warning.
+typedef struct {
+    int files;     /* indexable .py files written into the root */
+    int limit;     /* auto_index_limit */
+    bool git_root; /* emulate a checkout via <root>/.git/HEAD (no git binary) */
+} autoindex_limit_probe_t;
+
+static bool autoindex_limit_write_fixture(const char *repodir,
+                                          const autoindex_limit_probe_t *probe) {
+    if (th_mkdir_p(repodir) != 0) {
+        return false;
+    }
+    for (int i = 0; i < probe->files; i++) {
+        char path[640];
+        char body[96];
+        snprintf(path, sizeof(path), "%s/f%d.py", repodir, i);
+        snprintf(body, sizeof(body), "def f%d():\n    return %d\n", i, i);
+        if (th_write_file(path, body) != 0) {
+            return false;
+        }
+    }
+    if (probe->git_root) {
+        char gitdir[640];
+        char head[700];
+        snprintf(gitdir, sizeof(gitdir), "%s/.git", repodir);
+        snprintf(head, sizeof(head), "%s/HEAD", gitdir);
+        if (th_mkdir_p(gitdir) != 0 || th_write_file(head, "ref: refs/heads/main\n") != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Drive initialize → maybe_auto_index over a fresh root holding probe->files
+ * indexable files under auto_index_limit=probe->limit. skip_out receives the
+ * too_many_files warning (empty when admitted); *done_out reports whether an
+ * admitted auto-index ran to completion (the server free joins the thread).
  * Returns false on fixture setup failure. */
-static bool autoindex_skip_warning(char *out, size_t out_size) {
+static bool autoindex_limit_probe(const autoindex_limit_probe_t *probe, char *skip_out,
+                                  size_t skip_size, bool *done_out) {
     char cache[256];
     snprintf(cache, sizeof(cache), "%s/cbm-autoindex-limit-XXXXXX", cbm_tmpdir());
     if (!cbm_mkdtemp(cache)) {
@@ -18967,12 +19818,7 @@ static bool autoindex_skip_warning(char *out, size_t out_size) {
 
     char repodir[512];
     snprintf(repodir, sizeof(repodir), "%s/repo", cache);
-    char file_a[640];
-    char file_b[640];
-    snprintf(file_a, sizeof(file_a), "%s/a.py", repodir);
-    snprintf(file_b, sizeof(file_b), "%s/b.py", repodir);
-    if (th_mkdir_p(repodir) != 0 || th_write_file(file_a, "def a():\n    return 1\n") != 0 ||
-        th_write_file(file_b, "def b():\n    return 2\n") != 0) {
+    if (!autoindex_limit_write_fixture(repodir, probe)) {
         th_rmtree(cache);
         return false;
     }
@@ -18992,27 +19838,31 @@ static bool autoindex_skip_warning(char *out, size_t out_size) {
     bool ok = false;
     cbm_config_t *cfg = cbm_config_open(cache);
     if (cfg) {
+        char limit[32];
+        snprintf(limit, sizeof(limit), "%d", probe->limit);
         cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
-        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "1");
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, limit);
 
         cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
         if (srv) {
             autoindex_skip_log[0] = '\0';
+            autoindex_saw_done = false;
             CBMLogLevel prev_level = cbm_log_get_level();
-            cbm_log_set_level(CBM_LOG_WARN);
+            cbm_log_set_level(CBM_LOG_INFO);
             cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
-            cbm_log_set_sink_ex(autoindex_skip_capture_log, CBM_LOG_SINK_REPLACE);
+            cbm_log_set_sink_ex(autoindex_limit_capture_log, CBM_LOG_SINK_REPLACE);
 
             cbm_mcp_server_set_config(srv, cfg);
             char *resp = cbm_mcp_server_handle(
                 srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
             free(resp);
-            cbm_mcp_server_free(srv);
+            cbm_mcp_server_free(srv); /* joins an admitted autoindex thread */
 
             cbm_log_set_sink(NULL);
             cbm_log_set_level(prev_level);
 
-            snprintf(out, out_size, "%s", autoindex_skip_log);
+            snprintf(skip_out, skip_size, "%s", autoindex_skip_log);
+            *done_out = autoindex_saw_done;
             ok = true;
         }
         cbm_config_close(cfg);
@@ -19028,8 +19878,10 @@ static bool autoindex_skip_warning(char *out, size_t out_size) {
 /* RED before the fix: the warning carries `limit=auto_index_limit`, the config
  * key constant, instead of the configured value. */
 TEST(autoindex_skip_reports_numeric_limit_issue1466) {
+    autoindex_limit_probe_t probe = {.files = 2, .limit = 1, .git_root = false};
     char warning[1024];
-    if (!autoindex_skip_warning(warning, sizeof(warning))) {
+    bool done = false;
+    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
         PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
     }
     /* Not vacuous: the skip path must actually have been taken. */
@@ -19038,6 +19890,58 @@ TEST(autoindex_skip_reports_numeric_limit_issue1466) {
     ASSERT_NOT_NULL(strstr(warning, "files=2"));
     ASSERT_NOT_NULL(strstr(warning, "limit=1"));
     ASSERT_NULL(strstr(warning, "limit=auto_index_limit"));
+    ASSERT_FALSE(done);
+    PASS();
+}
+
+/* #713 at the reporter's shape scaled down (60 files vs limit 50, from
+ * 60k vs 50k): a PLAIN directory over the limit is refused, and the line
+ * names the limit and the root. RED on the `git ls-files` guard (count 0 →
+ * admitted → indexed) and RED while the line does not name the root. */
+TEST(autoindex_limit_guards_non_git_root_issue713) {
+    autoindex_limit_probe_t probe = {.files = 60, .limit = 50, .git_root = false};
+    char warning[1024];
+    bool done = false;
+    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    ASSERT_NOT_NULL(strstr(warning, "msg=autoindex.skip"));
+    ASSERT_NOT_NULL(strstr(warning, "reason=too_many_files"));
+    ASSERT_NOT_NULL(strstr(warning, "limit=50"));
+    const char *root = strstr(warning, "root=");
+    ASSERT_NOT_NULL(root);
+    ASSERT_NOT_NULL(strstr(root, "/repo"));
+    ASSERT_FALSE(done);
+    PASS();
+}
+
+/* The same plain directory one file UNDER the limit is admitted and indexed:
+ * the guard bounds, it does not fail closed on every non-git root. */
+TEST(autoindex_limit_admits_non_git_root_under_limit_issue713) {
+    autoindex_limit_probe_t probe = {.files = 49, .limit = 50, .git_root = false};
+    char warning[1024];
+    bool done = false;
+    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    ASSERT(warning[0] == '\0');
+    ASSERT_TRUE(done);
+    PASS();
+}
+
+/* A checkout keeps its behaviour: one bounded count for both root kinds. */
+TEST(autoindex_limit_guards_git_root_issue713) {
+    autoindex_limit_probe_t probe = {.files = 60, .limit = 50, .git_root = true};
+    char warning[1024];
+    bool done = false;
+    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    ASSERT_NOT_NULL(strstr(warning, "msg=autoindex.skip"));
+    ASSERT_NOT_NULL(strstr(warning, "reason=too_many_files"));
+    ASSERT_NOT_NULL(strstr(warning, "limit=50"));
+    ASSERT_NOT_NULL(strstr(warning, "root="));
+    ASSERT_FALSE(done);
     PASS();
 }
 
@@ -19958,7 +20862,70 @@ TEST(bm25_searches_legacy_four_column_fts_without_error_issue518) {
     PASS();
 }
 
+/* #2144: async/status need the daemon's job registry. An in-process server
+ * (index worker, embedder) has no process that outlives the call, so it must
+ * refuse both modes instead of silently running a blocking index. */
+TEST(index_repository_async_and_status_refused_without_daemon_issue2144) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *async_reply = cbm_mcp_handle_tool(srv, "index_repository",
+                                            "{\"repo_path\":\"/nonexistent-2144\","
+                                            "\"async\":true}");
+    char *status_reply = cbm_mcp_handle_tool(srv, "index_repository",
+                                             "{\"repo_path\":\"/nonexistent-2144\","
+                                             "\"status\":true}");
+    cbm_mcp_server_free(srv);
+    ASSERT_NOT_NULL(async_reply);
+    ASSERT_NOT_NULL(strstr(async_reply, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(async_reply, "daemon"));
+    ASSERT_NOT_NULL(status_reply);
+    ASSERT_NOT_NULL(strstr(status_reply, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(status_reply, "daemon"));
+    free(async_reply);
+    free(status_reply);
+    PASS();
+}
+
+/* #2144: the tool schema advertises both flags and the description explains
+ * the deadline problem and the polling pattern. */
+TEST(index_repository_schema_documents_async_polling_issue2144) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":2144,\"method\":\"tools/list\"}");
+    cbm_mcp_server_free(srv);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"async\":{\"type\":\"boolean\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"status\":{\"type\":\"boolean\""));
+    ASSERT_NOT_NULL(strstr(resp, "per-call deadline"));
+    ASSERT_NOT_NULL(strstr(resp, "poll with status:true"));
+    free(resp);
+    PASS();
+}
+
+/* #2144: a notice rides on a JSON payload as a key (content text and
+ * structuredContent together) and on a text payload as a paragraph. */
+TEST(tool_result_add_notice_keeps_payload_shape_issue2144) {
+    char *object = cbm_mcp_tool_result_add_notice(
+        cbm_mcp_text_result("{\"status\":\"indexed\"}", false), "retry async");
+    char *text =
+        cbm_mcp_tool_result_add_notice(cbm_mcp_text_result("plain failure", true), "retry async");
+    ASSERT_NOT_NULL(object);
+    ASSERT_NOT_NULL(strstr(object, "\"structuredContent\":{\"status\":\"indexed\","
+                                   "\"notice\":\"retry async\"}"));
+    ASSERT_NOT_NULL(strstr(object, "\"isError\":false"));
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "plain failure\\n\\nretry async"));
+    ASSERT_NOT_NULL(strstr(text, "\"isError\":true"));
+    free(object);
+    free(text);
+    PASS();
+}
+
 SUITE(mcp) {
+    RUN_TEST(index_repository_async_and_status_refused_without_daemon_issue2144);
+    RUN_TEST(index_repository_schema_documents_async_polling_issue2144);
+    RUN_TEST(tool_result_add_notice_keeps_payload_shape_issue2144);
     /* #518/#519 — BM25 prose search */
     RUN_TEST(bm25_finds_section_by_its_prose_issue518);
     RUN_TEST(bm25_finds_module_by_promoted_description_issue519);
@@ -20007,6 +20974,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_discovery_defaults_match_runtime_contract);
     RUN_TEST(mcp_metadata_byte_budget);
     RUN_TEST(mcp_tools_have_behavior_annotations);
+    RUN_TEST(mcp_tool_annotations_only_mutators_are_writable_issue2118);
     RUN_TEST(mcp_index_repository_declares_name_override_issue571);
     RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
@@ -20093,10 +21061,13 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
     RUN_TEST(tool_lean_defaults_schema_and_status);
     RUN_TEST(tool_index_status_keeps_authoritative_ignored_total_when_rows_are_sampled);
+    RUN_TEST(tool_index_status_reports_an_unreadable_count_as_an_error);
     RUN_TEST(tool_output_regression_gate);
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_bm25_reports_candidate_saturation);
+    RUN_TEST(tool_search_graph_bm25_applies_label_filter);
+    RUN_TEST(tool_search_graph_bm25_ranks_exact_name_first);
     RUN_TEST(tool_search_graph_rejects_bm25_and_semantic_query_together);
     RUN_TEST(tool_search_graph_semantic_ceiling_never_emits_unusable_continuation);
     RUN_TEST(tool_search_graph_semantic_pagination_is_lossless_and_independent);
@@ -20120,6 +21091,7 @@ SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_preserves_multiple_scope_labels);
     RUN_TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_issue1613);
     RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
+    RUN_TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714);
     RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
     RUN_TEST(tool_index_status_includes_git_metadata);
@@ -20155,6 +21127,8 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_accepts_project_name_alias_issue640);
     RUN_TEST(tool_search_graph_accepts_project_name_alias_issue640);
     RUN_TEST(tool_project_arg_resolves_unique_tail_issue1025);
+    RUN_TEST(tool_project_arg_resolves_non_ascii_folder_issue1827);
+    RUN_TEST(tool_index_repository_reuses_existing_project_for_root_issue2134);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 
@@ -20238,6 +21212,7 @@ SUITE(mcp) {
     RUN_TEST(index_repository_relative_path_uses_explicit_session_root);
     RUN_TEST(index_repository_supervisor_uses_canonical_session_path);
     RUN_TEST(index_repository_cli_name_override_issue823);
+    RUN_TEST(index_repository_over_budget_reports_named_reason);
     RUN_TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery);
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
     RUN_TEST(index_supervisor_start_failure_is_fail_closed_in_real_host);
@@ -20254,6 +21229,7 @@ SUITE(mcp) {
     RUN_TEST(tool_detect_changes_invalid_base_is_an_error);
     RUN_TEST(tool_detect_changes_preserves_utf8_git_path_and_impact_seed);
     RUN_TEST(tool_detect_changes_finds_nested_untracked_file_and_impact_seed);
+    RUN_TEST(tool_detect_changes_subdirectory_project_translates_git_root_paths_issue1951);
     RUN_TEST(tool_detect_changes_escapes_newline_path_in_tree_and_round_trips_json);
     RUN_TEST(tool_detect_changes_staged_rename_uses_exact_destination_record);
     RUN_TEST(tool_detect_changes_contained_commands_clean_up_error_and_success);
@@ -20320,6 +21296,9 @@ SUITE(mcp) {
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
     RUN_TEST(autoindex_skip_reports_numeric_limit_issue1466);
+    RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
+    RUN_TEST(autoindex_limit_admits_non_git_root_under_limit_issue713);
+    RUN_TEST(autoindex_limit_guards_git_root_issue713);
 }
 
 /* Kept separate so daemon-coordination regressions can be iterated without
